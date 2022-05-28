@@ -1,5 +1,6 @@
 import {
   InternalServerErrorException,
+  RawBodyRequest,
   RequestMethod,
   StreamableFile,
   VersioningType,
@@ -19,11 +20,13 @@ import {
   isNil,
   isObject,
   isString,
+  isUndefined,
 } from '@nestjs/common/utils/shared.utils';
 import { AbstractHttpAdapter } from '@nestjs/core/adapters/http-adapter';
 import { RouterMethodFactory } from '@nestjs/core/helpers/router-method-factory';
 import {
   json as bodyParserJson,
+  OptionsJson,
   urlencoded as bodyParserUrlencoded,
 } from 'body-parser';
 import * as cors from 'cors';
@@ -31,6 +34,15 @@ import * as express from 'express';
 import * as http from 'http';
 import * as https from 'https';
 import { ServeStaticOptions } from '../interfaces/serve-static-options.interface';
+
+type VersionedRoute = <
+  TRequest extends Record<string, any> = any,
+  TResponse = any,
+>(
+  req: TRequest,
+  res: TResponse,
+  next: () => void,
+) => any;
 
 export class ExpressAdapter extends AbstractHttpAdapter {
   private readonly routerMethodFactory = new RouterMethodFactory();
@@ -48,11 +60,23 @@ export class ExpressAdapter extends AbstractHttpAdapter {
     }
     if (body instanceof StreamableFile) {
       const streamHeaders = body.getHeaders();
-      if (response.getHeader('Content-Type') === undefined) {
+      if (
+        response.getHeader('Content-Type') === undefined &&
+        streamHeaders.type !== undefined
+      ) {
         response.setHeader('Content-Type', streamHeaders.type);
       }
-      if (response.getHeader('Content-Disposition') === undefined) {
+      if (
+        response.getHeader('Content-Disposition') === undefined &&
+        streamHeaders.disposition !== undefined
+      ) {
         response.setHeader('Content-Disposition', streamHeaders.disposition);
+      }
+      if (
+        response.getHeader('Content-Length') === undefined &&
+        streamHeaders.length !== undefined
+      ) {
+        response.setHeader('Content-Length', streamHeaders.length);
       }
       return body.getStream().pipe(response);
     }
@@ -163,9 +187,21 @@ export class ExpressAdapter extends AbstractHttpAdapter {
     this.httpServer = http.createServer(this.getInstance());
   }
 
-  public registerParserMiddleware() {
+  public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+    let bodyParserJsonOptions: OptionsJson | undefined;
+    if (rawBody === true) {
+      bodyParserJsonOptions = {
+        verify: (req: RawBodyRequest<http.IncomingMessage>, _res, buffer) => {
+          if (Buffer.isBuffer(buffer)) {
+            req.rawBody = buffer;
+          }
+          return true;
+        },
+      };
+    }
+
     const parserMiddleware = {
-      jsonParser: bodyParserJson(),
+      jsonParser: bodyParserJson(bodyParserJsonOptions),
       urlencodedParser: bodyParserUrlencoded({ extended: true }),
     };
     Object.keys(parserMiddleware)
@@ -186,21 +222,76 @@ export class ExpressAdapter extends AbstractHttpAdapter {
     handler: Function,
     version: VersionValue,
     versioningOptions: VersioningOptions,
-  ) {
-    return <TRequest extends Record<string, any> = any, TResponse = any>(
-      req: TRequest,
-      res: TResponse,
-      next: () => void,
-    ) => {
-      if (version === VERSION_NEUTRAL) {
-        return handler(req, res, next);
+  ): VersionedRoute {
+    const callNextHandler: VersionedRoute = (req, res, next) => {
+      if (!next) {
+        throw new InternalServerErrorException(
+          'HTTP adapter does not support filtering on version',
+        );
       }
+      return next();
+    };
+
+    if (
+      version === VERSION_NEUTRAL ||
       // URL Versioning is done via the path, so the filter continues forward
-      if (versioningOptions.type === VersioningType.URI) {
-        return handler(req, res, next);
-      }
-      // Media Type (Accept Header) Versioning Handler
-      if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
+      versioningOptions.type === VersioningType.URI
+    ) {
+      const handlerForNoVersioning: VersionedRoute = (req, res, next) =>
+        handler(req, res, next);
+
+      return handlerForNoVersioning;
+    }
+
+    // Custom Extractor Versioning Handler
+    if (versioningOptions.type === VersioningType.CUSTOM) {
+      const handlerForCustomVersioning: VersionedRoute = (req, res, next) => {
+        const extractedVersion = versioningOptions.extractor(req);
+
+        if (Array.isArray(version)) {
+          if (
+            Array.isArray(extractedVersion) &&
+            version.filter(v => extractedVersion.includes(v as string)).length
+          ) {
+            return handler(req, res, next);
+          }
+
+          if (
+            isString(extractedVersion) &&
+            version.includes(extractedVersion)
+          ) {
+            return handler(req, res, next);
+          }
+        } else if (isString(version)) {
+          // Known bug here - if there are multiple versions supported across separate
+          // handlers/controllers, we can't select the highest matching handler.
+          // Since this code is evaluated per-handler, then we can't see if the highest
+          // specified version exists in a different handler.
+          if (
+            Array.isArray(extractedVersion) &&
+            extractedVersion.includes(version)
+          ) {
+            return handler(req, res, next);
+          }
+
+          if (isString(extractedVersion) && version === extractedVersion) {
+            return handler(req, res, next);
+          }
+        }
+
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForCustomVersioning;
+    }
+
+    // Media Type (Accept Header) Versioning Handler
+    if (versioningOptions.type === VersioningType.MEDIA_TYPE) {
+      const handlerForMediaTypeVersioning: VersionedRoute = (
+        req,
+        res,
+        next,
+      ) => {
         const MEDIA_TYPE_HEADER = 'Accept';
         const acceptHeaderValue: string | undefined =
           req.headers?.[MEDIA_TYPE_HEADER] ||
@@ -208,9 +299,16 @@ export class ExpressAdapter extends AbstractHttpAdapter {
 
         const acceptHeaderVersionParameter = acceptHeaderValue
           ? acceptHeaderValue.split(';')[1]
-          : '';
+          : undefined;
 
-        if (acceptHeaderVersionParameter) {
+        // No version was supplied
+        if (isUndefined(acceptHeaderVersionParameter)) {
+          if (Array.isArray(version)) {
+            if (version.includes(VERSION_NEUTRAL)) {
+              return handler(req, res, next);
+            }
+          }
+        } else {
           const headerVersion = acceptHeaderVersionParameter.split(
             versioningOptions.key,
           )[1];
@@ -225,14 +323,28 @@ export class ExpressAdapter extends AbstractHttpAdapter {
             }
           }
         }
-      }
-      // Header Versioning Handler
-      else if (versioningOptions.type === VersioningType.HEADER) {
+
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForMediaTypeVersioning;
+    }
+
+    // Header Versioning Handler
+    if (versioningOptions.type === VersioningType.HEADER) {
+      const handlerForHeaderVersioning: VersionedRoute = (req, res, next) => {
         const customHeaderVersionParameter: string | undefined =
           req.headers?.[versioningOptions.header] ||
           req.headers?.[versioningOptions.header.toLowerCase()];
 
-        if (customHeaderVersionParameter) {
+        // No version was supplied
+        if (isUndefined(customHeaderVersionParameter)) {
+          if (Array.isArray(version)) {
+            if (version.includes(VERSION_NEUTRAL)) {
+              return handler(req, res, next);
+            }
+          }
+        } else {
           if (Array.isArray(version)) {
             if (version.includes(customHeaderVersionParameter)) {
               return handler(req, res, next);
@@ -243,15 +355,12 @@ export class ExpressAdapter extends AbstractHttpAdapter {
             }
           }
         }
-      }
 
-      if (!next) {
-        throw new InternalServerErrorException(
-          'HTTP adapter does not support filtering on version',
-        );
-      }
-      return next();
-    };
+        return callNextHandler(req, res, next);
+      };
+
+      return handlerForHeaderVersioning;
+    }
   }
 
   private isMiddlewareApplied(name: string): boolean {

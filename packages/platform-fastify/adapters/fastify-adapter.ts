@@ -1,6 +1,7 @@
 import {
   HttpStatus,
   Logger,
+  RawBodyRequest,
   RequestMethod,
   StreamableFile,
   VersioningOptions,
@@ -12,10 +13,11 @@ import {
   CorsOptionsDelegate,
 } from '@nestjs/common/interfaces/external/cors-options.interface';
 import { loadPackage } from '@nestjs/common/utils/load-package.util';
-import { isUndefined, isString } from '@nestjs/common/utils/shared.utils';
+import { isString, isUndefined } from '@nestjs/common/utils/shared.utils';
 import { AbstractHttpAdapter } from '@nestjs/core/adapters/http-adapter';
 import {
   fastify,
+  FastifyBodyParser,
   FastifyInstance,
   FastifyLoggerInstance,
   FastifyPluginAsync,
@@ -115,23 +117,27 @@ export class FastifyAdapter<
       }
     },
     storage() {
-      const versions = new Map();
+      const versions = new Map<string, unknown>();
       return {
         get(version: string | Array<string>) {
+          if (Array.isArray(version)) {
+            return versions.get(version.find(v => versions.has(v))) || null;
+          }
           return versions.get(version) || null;
         },
-        set(
-          versionOrVersions: string | Array<string>,
-          store: Map<string, any>,
-        ) {
-          const storeVersionConstraint = version =>
+        set(versionOrVersions: string | Array<string>, store: unknown) {
+          const storeVersionConstraint = (version: string) =>
             versions.set(version, store);
           if (Array.isArray(versionOrVersions))
             versionOrVersions.forEach(storeVersionConstraint);
           else storeVersionConstraint(versionOrVersions);
         },
         del(version: string | Array<string>) {
-          versions.delete(version);
+          if (Array.isArray(version)) {
+            version.forEach(v => versions.delete(v));
+          } else {
+            versions.delete(version);
+          }
         },
         empty() {
           versions.clear();
@@ -150,12 +156,9 @@ export class FastifyAdapter<
           ? acceptHeaderValue.split(';')[1]
           : '';
 
-        if (acceptHeaderVersionParameter) {
-          const headerVersion = acceptHeaderVersionParameter.split(
-            this.versioningOptions.key,
-          )[1];
-          return headerVersion;
-        }
+        return isUndefined(acceptHeaderVersionParameter)
+          ? VERSION_NEUTRAL // No version was supplied
+          : acceptHeaderVersionParameter.split(this.versioningOptions.key)[1];
       }
       // Header Versioning Handler
       else if (this.versioningOptions.type === VersioningType.HEADER) {
@@ -163,9 +166,13 @@ export class FastifyAdapter<
           req.headers?.[this.versioningOptions.header] ||
           req.headers?.[this.versioningOptions.header.toLowerCase()];
 
-        if (customHeaderVersionParameter) {
-          return customHeaderVersionParameter;
-        }
+        return isUndefined(customHeaderVersionParameter)
+          ? VERSION_NEUTRAL // No version was supplied
+          : customHeaderVersionParameter;
+      }
+      // Custom Versioning Handler
+      else if (this.versioningOptions.type === VersioningType.CUSTOM) {
+        return this.versioningOptions.extractor(req);
       }
       return undefined;
     },
@@ -282,11 +289,23 @@ export class FastifyAdapter<
     }
     if (body instanceof StreamableFile) {
       const streamHeaders = body.getHeaders();
-      if (fastifyReply.getHeader('Content-Type') === undefined) {
+      if (
+        fastifyReply.getHeader('Content-Type') === undefined &&
+        streamHeaders.type !== undefined
+      ) {
         fastifyReply.header('Content-Type', streamHeaders.type);
       }
-      if (fastifyReply.getHeader('Content-Disposition') === undefined) {
+      if (
+        fastifyReply.getHeader('Content-Disposition') === undefined &&
+        streamHeaders.disposition !== undefined
+      ) {
         fastifyReply.header('Content-Disposition', streamHeaders.disposition);
+      }
+      if (
+        fastifyReply.getHeader('Content-Length') === undefined &&
+        streamHeaders.length !== undefined
+      ) {
+        fastifyReply.header('Content-Length', streamHeaders.length);
       }
       body = body.getStream();
     }
@@ -407,11 +426,16 @@ export class FastifyAdapter<
     this.register(import('fastify-cors'), options);
   }
 
-  public registerParserMiddleware() {
+  public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
     if (this._isParserRegistered) {
       return;
     }
     this.register(import('fastify-formbody'));
+
+    if (rawBody) {
+      this.registerContentParserWithRawBody();
+    }
+
     this._isParserRegistered = true;
   }
 
@@ -422,9 +446,12 @@ export class FastifyAdapter<
       await this.registerMiddie();
     }
     return (path: string, callback: Function) => {
-      const normalizedPath = path.endsWith('/*')
+      let normalizedPath = path.endsWith('/*')
         ? `${path.slice(0, -1)}(.*)`
         : path;
+
+      // Fallback to "(.*)" to support plugins like GraphQL
+      normalizedPath = normalizedPath === '/(.*)' ? '(.*)' : normalizedPath;
 
       // The following type assertion is valid as we use import('middie') rather than require('middie')
       // ref https://github.com/fastify/middie/pull/55
@@ -454,6 +481,30 @@ export class FastifyAdapter<
     response: TRawResponse | TReply,
   ): response is TRawResponse {
     return !('status' in response);
+  }
+
+  private registerContentParserWithRawBody() {
+    this.getInstance().addContentTypeParser<Buffer>(
+      'application/json',
+      { parseAs: 'buffer' },
+      (
+        req: RawBodyRequest<FastifyRequest<unknown, TServer, TRawRequest>>,
+        body: Buffer,
+        done,
+      ) => {
+        if (Buffer.isBuffer(body)) {
+          req.rawBody = body;
+        }
+
+        const { onProtoPoisoning, onConstructorPoisoning } =
+          this.instance.initialConfig;
+        const defaultJsonParser = this.instance.getDefaultJsonParser(
+          onProtoPoisoning || 'error',
+          onConstructorPoisoning || 'error',
+        ) as FastifyBodyParser<string | Buffer, TServer>;
+        defaultJsonParser(req, body, done);
+      },
+    );
   }
 
   private async registerMiddie() {

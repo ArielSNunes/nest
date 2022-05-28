@@ -3,8 +3,9 @@ import { loadPackage } from '@nestjs/common/utils/load-package.util';
 import { randomStringGenerator } from '@nestjs/common/utils/random-string-generator.util';
 import { EventEmitter } from 'events';
 import { EmptyError, fromEvent, lastValueFrom, merge, Observable } from 'rxjs';
-import { first, map, share, switchMap } from 'rxjs/operators';
+import { first, map, retryWhen, scan, share, switchMap } from 'rxjs/operators';
 import {
+  CONNECT_FAILED_EVENT,
   DISCONNECTED_RMQ_MESSAGE,
   DISCONNECT_EVENT,
   ERROR_EVENT,
@@ -110,12 +111,28 @@ export class ClientRMQ extends ClientProxy {
     instance: any,
     source$: Observable<T>,
   ): Observable<T> {
-    const close$ = fromEvent(instance, DISCONNECT_EVENT).pipe(
-      map((err: any) => {
-        throw err;
-      }),
+    const eventToError = (eventType: string) =>
+      fromEvent(instance, eventType).pipe(
+        map((err: any) => {
+          throw err;
+        }),
+      );
+    const disconnect$ = eventToError(DISCONNECT_EVENT);
+
+    const urls = this.getOptionsProp(this.options, 'urls', []);
+    const connectFailed$ = eventToError(CONNECT_FAILED_EVENT).pipe(
+      retryWhen(e =>
+        e.pipe(
+          scan((errorCount, error: any) => {
+            if (urls.indexOf(error.url) >= urls.length - 1) {
+              throw error;
+            }
+            return errorCount + 1;
+          }, 0),
+        ),
+      ),
     );
-    return merge(source$, close$).pipe(first());
+    return merge(source$, disconnect$, connectFailed$).pipe(first());
   }
 
   public async setupChannel(channel: any, resolve: Function) {
@@ -218,14 +235,17 @@ export class ClientRMQ extends ClientProxy {
     const serializedPacket: ReadPacket & Partial<RmqRecord> =
       this.serializer.serialize(packet);
 
+    const options = serializedPacket.options;
+    delete serializedPacket.options;
+
     return new Promise<void>((resolve, reject) =>
       this.channel.sendToQueue(
         this.queue,
         Buffer.from(JSON.stringify(serializedPacket)),
         {
           persistent: this.persistent,
-          ...serializedPacket.options,
-          headers: this.mergeHeaders(serializedPacket.options?.headers),
+          ...options,
+          headers: this.mergeHeaders(options?.headers),
         },
         (err: unknown) => (err ? reject(err) : resolve()),
       ),
